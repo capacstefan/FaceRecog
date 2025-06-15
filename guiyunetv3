@@ -1,0 +1,660 @@
+import os
+import cv2
+import time
+import threading
+import numpy as np
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from PIL import Image, ImageTk
+from datetime import datetime
+
+EMBEDDINGS_FILE = "faces.npy"
+COSINE_THRESHOLD = 0.5
+
+# Load models
+face_detector = cv2.FaceDetectorYN_create("face_detection_yunet_2023mar.onnx", "", (0, 0))
+face_detector.setScoreThreshold(0.6)
+face_recognizer = cv2.FaceRecognizerSF_create("face_recognizer_fast.onnx", "")
+
+# Shared state
+recognition_running = False
+recognition_thread = None
+stop_flag = False
+reference_embeddings = {} # name -> [embedding, start, end, undef]
+
+# Variabile globale pentru a stoca datele temporare și referințe la widget-uri
+temp_face_embedding = None
+temp_name_entry = None
+temp_start_entry = None
+temp_end_entry = None
+temp_undef_var = None
+face_detection_status_label = None
+
+# Variabilă globală pentru a stoca ultimul status afișat pe ecran
+last_displayed_status_text = ""
+
+# Variabile globale pentru video stream și display
+video_label = None
+cap = None # Camera OpenCV
+verification_timer = None # Timer pentru oprirea automată a verificării
+
+# Variabile pentru UI-ul de Admin
+admin_password_entry = None
+login_error_label = None # Added for admin login error message
+
+# Dimensiuni implicite pentru video, folosite pentru placeholder
+DEFAULT_VIDEO_WIDTH = 320
+DEFAULT_VIDEO_HEIGHT = 240
+
+# --- Functii de incarcare/salvare embeddings, update status ---
+def load_embeddings():
+    global reference_embeddings
+    if os.path.exists(EMBEDDINGS_FILE):
+        reference_embeddings = np.load(EMBEDDINGS_FILE, allow_pickle=True).item()
+    else:
+        reference_embeddings = {}
+
+def save_embeddings():
+    np.save(EMBEDDINGS_FILE, reference_embeddings)
+
+def update_status(text, color):
+    global last_displayed_status_text
+    if text != last_displayed_status_text:
+        status_label.config(text=text, fg=color)
+        last_displayed_status_text = text
+
+# --- Functii pentru thread-ul de recunoastere si camera ---
+def recognize_loop():
+    global stop_flag, cap, video_label, recognition_running
+
+    # Setam marimea pentru detector o singura data aici
+    face_detector.setInputSize((DEFAULT_VIDEO_WIDTH, DEFAULT_VIDEO_HEIGHT))
+
+    if cap is None or not cap.isOpened():
+        # url = r"rtsp://admin:adminadmin1@192.168.1.108:554/cam/realmonitor?channel=1&subtype=1"
+        url = r"http://192.168.1.133:4747/video"
+        cap = cv2.VideoCapture(0) # Folosește camera implicită
+
+
+    frame_counter = 0
+
+    while not stop_flag:
+        ret, frame = cap.read()
+        if not ret:
+            root.after(0, update_status, "No connection to camera", "red") # Updated message and color
+            # Afiseaza un placeholder sau un mesaj de eroare pe video_label
+            blank_img = np.zeros((DEFAULT_VIDEO_HEIGHT, DEFAULT_VIDEO_WIDTH, 3), dtype=np.uint8)
+            # Obține culoarea de fundal a main_content_frame ca o string hexa (ex: '#1a1a1a')
+            bg_hex_color = main_content_frame["bg"]
+
+            # Convertește culoarea hexa la tuplu RGB (0-255)
+            def hex_to_rgb(hex_color):
+                hex_color = hex_color.lstrip('#')
+                return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+            rgb_color = hex_to_rgb(bg_hex_color)
+
+            # Converteste RGB la BGR pentru OpenCV
+            bgr_color = (rgb_color[2], rgb_color[1], rgb_color[0]) # (R, G, B) devine (B, G, R)
+            blank_img[:,:] = bgr_color # Match main_content_frame bg
+            img = Image.fromarray(blank_img)
+            imgtk = ImageTk.PhotoImage(image=img)
+            root.after(0, lambda: video_label.config(image=imgtk))
+            root.after(0, lambda: setattr(video_label, '_imgtk', imgtk))
+            time.sleep(1)
+            continue
+
+        frame_display = cv2.resize(frame, (DEFAULT_VIDEO_WIDTH, DEFAULT_VIDEO_HEIGHT))
+        frame_process = frame_display.copy()
+
+        frame_counter += 1
+
+        if frame_counter % 10 == 0:
+            _, faces = face_detector.detect(frame_process)
+            current_status_text = "Locked"
+            current_status_color = "#e74c3c"
+
+            if faces is not None and len(faces) > 0:
+                faces_np = np.array(faces)
+                valid_faces = faces_np[np.where((faces_np[:, 2] > 0) & (faces_np[:, 3] > 0))]
+
+                if len(valid_faces) > 0:
+                    areas = valid_faces[:, 2] * valid_faces[:, 3]
+                    sorted_indices = np.argsort(areas)[::-1]
+                    largest_face = valid_faces[sorted_indices[0]]
+
+                    x, y, w, h = int(largest_face[0]), int(largest_face[1]), int(largest_face[2]), int(largest_face[3])
+                    cv2.rectangle(frame_display, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+                    aligned = face_recognizer.alignCrop(frame_process, largest_face)
+                    feature = face_recognizer.feature(aligned)
+
+                    for name, data in reference_embeddings.items():
+                        ref_emb, start_date_str, end_date_str, undef = data
+                        score = face_recognizer.match(feature, ref_emb, cv2.FaceRecognizerSF_FR_COSINE)
+
+                        if score >= COSINE_THRESHOLD:
+                            current_status_text = f"Unlocked: {name}"
+                            current_status_color = "#2ecc71"
+                            break
+
+            root.after(0, update_status, current_status_text, current_status_color)
+
+        img = cv2.cvtColor(frame_display, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(img)
+        imgtk = ImageTk.PhotoImage(image=img)
+
+        # video_label este garantat sa existe acum
+        root.after(0, lambda: video_label.config(image=imgtk))
+        root.after(0, lambda: setattr(video_label, '_imgtk', imgtk)) # Previne garbage collection
+
+        time.sleep(0.01)
+
+    if cap:
+        cap.release()
+        cap = None
+
+    # Odata ce recunoasterea s-a oprit, reseteaza video_label la starea initiala
+    root.after(0, lambda: update_video_label_placeholder())
+    root.after(0, lambda: update_status("Idle", "gray"))
+
+
+def start_recognition():
+    """
+    Porneste fluxul video, recunoasterea faciala si seteaza un timer de oprire.
+    """
+    global recognition_running, recognition_thread, stop_flag, cap, verification_timer
+
+    if verification_timer:
+        root.after_cancel(verification_timer)
+        verification_timer = None
+
+    if recognition_running:
+        stop_flag = True
+        if recognition_thread and recognition_thread.is_alive():
+            recognition_thread.join(timeout=1)
+        recognition_running = False
+        if cap:
+            cap.release()
+            cap = None
+
+    if not recognition_running:
+        stop_flag = False
+        recognition_thread = threading.Thread(target=recognize_loop, daemon=True)
+        recognition_thread.start()
+        recognition_running = True
+        update_status("Initializing...", "gray")
+
+        verification_timer = root.after(5000, stop_recognition_and_video)
+
+
+def stop_recognition_and_video():
+    """
+    Oprește thread-ul de recunoaștere, eliberează camera și resetează video_label la placeholder.
+    """
+    global recognition_running, stop_flag, cap, video_label, recognition_thread, verification_timer
+
+    stop_flag = True
+
+    if verification_timer:
+        root.after_cancel(verification_timer)
+        verification_timer = None
+
+    if recognition_thread and recognition_thread.is_alive():
+        recognition_thread.join(timeout=1)
+
+    recognition_running = False
+
+    if cap:
+        cap.release()
+        cap = None
+
+    # Acum, in loc sa distrugem video_label, il resetam la placeholder
+    root.after(0, update_video_label_placeholder)
+    root.after(0, lambda: update_status("Idle", "gray"))
+
+def reset_recognition_state():
+    """
+    Resetează starea sistemului (fără a reporni automat video-ul).
+    Utilizată în meniul Admin.
+    """
+    stop_recognition_and_video() # Acum aceasta functie va seta placeholder-ul
+    update_status("System Reset", "gray")
+
+def update_video_label_placeholder():
+    """
+    Actualizează video_label pentru a afișa un placeholder gri cu text.
+    """
+    global video_label
+    blank_img = np.zeros((DEFAULT_VIDEO_HEIGHT, DEFAULT_VIDEO_WIDTH, 3), dtype=np.uint8)
+
+    # Obține culoarea de fundal a main_content_frame ca o string hexa (ex: '#1a1a1a')
+    bg_hex_color = main_content_frame["bg"]
+
+    # Convertește culoarea hexa la tuplu RGB (0-255)
+    # tk.Label(bg="#1a1a1a") va returna direct stringul "#1a1a1a"
+    # Folosim o mică funcție pentru conversie
+    def hex_to_rgb(hex_color):
+        hex_color = hex_color.lstrip('#')
+        return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+    rgb_color = hex_to_rgb(bg_hex_color)
+
+    # Converteste RGB la BGR pentru OpenCV
+    bgr_color = (rgb_color[2], rgb_color[1], rgb_color[0]) # (R, G, B) devine (B, G, R)
+
+    blank_img[:,:] = bgr_color # Setează fundalul gri închis
+    text = "Press Verify to Start"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.7
+    font_thickness = 2
+    text_color = (200, 200, 200) # Un gri mai deschis pentru text
+
+    text_size = cv2.getTextSize(text, font, font_scale, font_thickness)[0]
+    text_x = (DEFAULT_VIDEO_WIDTH - text_size[0]) // 2
+    text_y = (DEFAULT_VIDEO_HEIGHT + text_size[1]) // 2
+
+    cv2.putText(blank_img, text, (text_x, text_y), font, font_scale, text_color, font_thickness, cv2.LINE_AA)
+
+    img = Image.fromarray(blank_img)
+    imgtk = ImageTk.PhotoImage(image=img)
+    video_label.config(image=imgtk)
+    video_label.image = imgtk # Keep a reference!
+
+# --- Funcții pentru managementul GUI ---
+def clear_main_content_frame():
+    """
+    Distruge TOATE widget-urile din main_content_frame, cu excepția video_label.
+    """
+    for widget in main_content_frame.winfo_children():
+        if widget != video_label: # Asigură-te că nu distrugi video_label
+            widget.destroy()
+
+def back_to_main():
+    """
+    Revine la ecranul principal cu butoanele Verify și Admin Settings.
+    """
+    global temp_face_embedding, temp_name_entry, temp_start_entry, temp_end_entry, temp_undef_var, face_detection_status_label, video_label, login_error_label
+
+    temp_face_embedding = None
+    temp_name_entry = None
+    temp_start_entry = None
+    temp_end_entry = None
+    temp_undef_var = None
+    face_detection_status_label = None
+    if login_error_label: # Clear the error label if it exists
+        login_error_label.destroy()
+        login_error_label = None
+
+    stop_recognition_and_video() # Opreste fluxul si seteaza placeholder-ul
+
+    clear_main_content_frame() # Curăță tot din main_content_frame (fără video_label)
+
+    # Creează video_label o singură dată aici, dacă nu există
+    if video_label is None:
+        # Seteaza width si height pentru a fixa dimensiunea label-ului
+        # Aceasta este cheia pentru a face zona gri sa aiba aceeasi dimensiune cu video-ul
+        video_label = tk.Label(main_content_frame, bg=main_content_frame["bg"], width=DEFAULT_VIDEO_WIDTH, height=DEFAULT_VIDEO_HEIGHT) # Match main_content_frame bg
+        video_label.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        update_video_label_placeholder() # Seteaza imaginea initiala
+    else:
+        # Asigură-te că video_label este vizibil și plasat corect
+        video_label.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        update_video_label_placeholder() # Asigură-te că afișează placeholder-ul
+
+    # Configurăm coloanele pentru main_content_frame
+    main_content_frame.grid_columnconfigure(0, weight=1) # Coloana 0 (video_label) va primi greutate pentru a se extinde
+    main_content_frame.grid_columnconfigure(1, weight=0) # Coloana 1 (button_column_frame) nu primește greutate
+    main_content_frame.grid_rowconfigure(0, weight=1) # Rândul principal
+
+    # Frame pentru butoane, plasat în coloana 1 (dreapta)
+    button_column_frame = tk.Frame(main_content_frame, bg="#1a1a1a")
+    button_column_frame.grid(row=0, column=1, padx=20, pady=0, sticky="ns")
+
+    # Adăugăm un "expander" invizibil deasupra și dedesubtul butoanelor pentru a le centra
+    button_column_frame.grid_rowconfigure(0, weight=1)
+    button_column_frame.grid_rowconfigure(1, weight=0)
+    button_column_frame.grid_rowconfigure(2, weight=0)
+    button_column_frame.grid_rowconfigure(3, weight=1)
+
+    tk.Button(button_column_frame, text="Verify", command=start_recognition,
+              bg="#28a745", fg="white", font=("Arial", 16, "bold"), # Mărit fontul
+              relief="flat", borderwidth=0, highlightthickness=0,
+              activebackground="#218838", activeforeground="white",
+              padx=20, pady=10, width=15).grid(row=1, column=0, pady=10, sticky="ew")
+
+    tk.Button(button_column_frame, text="Admin Settings", command=admin_settings_login,
+              font=("Arial", 16, "bold"), # Mărit fontul
+              width=15, **{k: v for k, v in button_style.items() if k != 'font'}).grid(row=2, column=0, pady=10, sticky="ew")
+
+    update_status("Idle", "gray")
+
+
+def admin_settings_login():
+    """
+    Afișează ecranul de login pentru administrator.
+    """
+    global admin_password_entry, login_error_label
+
+    stop_recognition_and_video() # Opreste si reseteaza video_label la placeholder
+    clear_main_content_frame() # Curăță tot (fără video_label)
+    update_status("Admin Login", "orange")
+
+    if video_label and video_label.winfo_exists():
+        video_label.grid_forget()
+
+    # Configurăm gridul pentru a centra conținutul de login
+    main_content_frame.grid_columnconfigure(0, weight=1)
+    main_content_frame.grid_columnconfigure(1, weight=1)
+    main_content_frame.grid_columnconfigure(2, weight=1)
+    main_content_frame.grid_rowconfigure(0, weight=1)
+    main_content_frame.grid_rowconfigure(1, weight=1)
+
+    login_frame = tk.Frame(main_content_frame, bg="#1a1a1a")
+    login_frame.grid(row=1, column=1, pady=20, sticky="nsew")
+
+    tk.Label(login_frame, text="Admin Password:", bg="#1a1a1a", fg="#f0f0f0", font=("Arial", 14, "bold")).pack(pady=(0,10)) # Mărit fontul
+    admin_password_entry = tk.Entry(login_frame, bg="#2a2a2a", fg="#f0f0f0", insertbackground="#f0f0f0", bd=1, relief="solid", font=("Arial", 14), show='*') # Mărit fontul
+    admin_password_entry.pack(ipadx=10, ipady=5) # Mărit padding
+    admin_password_entry.bind("<Return>", lambda event=None: check_admin_password())
+
+    login_error_label = tk.Label(login_frame, text="", bg="#1a1a1a", fg="red", font=("Arial", 12, "bold")) # Mărit fontul
+    login_error_label.pack(pady=(10, 0)) # Mărit padding
+
+    admin_login_button = tk.Button(login_frame, text="Login", command=check_admin_password, **button_style)
+    admin_login_button.pack(pady=15) # Mărit padding
+
+    tk.Button(login_frame, text="Cancel", command=back_to_main, **button_style).pack(pady=10) # Mărit padding
+
+def check_admin_password():
+    """
+    Verifică parola de administrator.
+    """
+    global login_error_label
+    password = admin_password_entry.get().strip()
+    if password == "1234": # Parola hardcodată
+        if login_error_label:
+            login_error_label.config(text="") # Clear the error message
+        show_admin_options()
+    else:
+        # Instead of messagebox, update the label
+        if login_error_label:
+            login_error_label.config(text="Incorrect password.")
+        admin_password_entry.delete(0, tk.END) # Golește câmpul parolei
+
+def show_admin_options():
+    """
+    Afișează opțiunile pentru administrator.
+    """
+    global login_error_label
+    clear_main_content_frame()
+    if login_error_label: # Ensure error label is removed when moving to admin options
+        login_error_label.destroy()
+        login_error_label = None
+
+    if video_label and video_label.winfo_exists():
+        video_label.grid_forget() # Asigură-te că video_label este ascuns în modul admin
+    update_status("Admin Mode", "orange")
+
+    # Configurăm gridul pentru a centra opțiunile de admin
+    main_content_frame.grid_columnconfigure(0, weight=1)
+    main_content_frame.grid_columnconfigure(1, weight=1)
+    main_content_frame.grid_columnconfigure(2, weight=1)
+    main_content_frame.grid_rowconfigure(0, weight=1)
+    main_content_frame.grid_rowconfigure(1, weight=1)
+
+    admin_buttons_frame = tk.Frame(main_content_frame, bg="#1a1a1a")
+    admin_buttons_frame.grid(row=1, column=1, pady=20, sticky="nsew") # Centrare în grid
+
+    tk.Label(admin_buttons_frame, text="Admin Options", bg="#1a1a1a", fg="#f0f0f0", font=("Arial", 16, "bold")).pack(pady=(0, 15)) # Mărit fontul
+    tk.Button(admin_buttons_frame, text="Add User", command=add_user, **button_style).pack(fill='x', pady=8) # Mărit padding
+    tk.Button(admin_buttons_frame, text="Delete User", command=delete_user, **button_style).pack(fill='x', pady=8) # Mărit padding
+
+    tk.Button(admin_buttons_frame, text="Reset System (Idle)", command=lambda: [reset_recognition_state(), show_admin_options()], **button_style).pack(fill='x', pady=8) # Mărit padding
+
+    tk.Button(admin_buttons_frame, text="Exit Admin", command=back_to_main, **button_style).pack(fill='x', pady=20) # Mărit padding
+
+def process_chosen_image():
+    """
+    Procesează o imagine aleasă de utilizator pentru adăugarea de fețe.
+    """
+    global temp_face_embedding, register_user_btn, face_detection_status_label
+
+    filepath = filedialog.askopenfilename(filetypes=[("Image files", "*.jpg *.jpeg *.png")])
+    if not filepath:
+        face_detection_status_label.config(text="No image selected.", fg="#f0f0f0")
+        return
+    image = cv2.imread(filepath)
+    if image is None:
+        face_detection_status_label.config(text="Error: Could not read image.", fg="#e74c3c")
+        temp_face_embedding = None
+        register_user_btn.config(state=tk.DISABLED)
+        return
+
+    img_resized = cv2.resize(image, (DEFAULT_VIDEO_WIDTH, DEFAULT_VIDEO_HEIGHT))
+
+    face_detector.setInputSize((DEFAULT_VIDEO_WIDTH, DEFAULT_VIDEO_HEIGHT))
+
+    _, faces = face_detector.detect(img_resized)
+    if faces is None or len(faces) == 0:
+        face_detection_status_label.config(text="No face detected in file.", fg="#e74c3c")
+        temp_face_embedding = None
+        register_user_btn.config(state=tk.DISABLED)
+        return
+
+    faces_np = np.array(faces)
+    valid_faces = faces_np[np.where((faces_np[:, 2] > 0) & (faces_np[:, 3] > 0))]
+
+    if len(valid_faces) > 0:
+        areas = valid_faces[:, 2] * valid_faces[:, 3]
+        largest_face = valid_faces[np.argsort(areas)[::-1][0]]
+
+        aligned_face = face_recognizer.alignCrop(img_resized, largest_face)
+        temp_face_embedding = face_recognizer.feature(aligned_face)
+        face_detection_status_label.config(text="Face detected in file.", fg="#2ecc71")
+        register_user_btn.config(state=tk.NORMAL)
+    else:
+        face_detection_status_label.config(text="No valid face detected in file.", fg="#e74c3c")
+        temp_face_embedding = None
+        register_user_btn.config(state=tk.DISABLED)
+
+
+def register_user_data():
+    """
+    Salvează datele noului utilizator (nume, embedding, perioadă de valabilitate).
+    """
+    global temp_face_embedding, temp_name_entry, temp_start_entry, temp_end_entry, temp_undef_var
+
+    if temp_face_embedding is None:
+        messagebox.showerror("Error", "Please choose an image and detect a face first.")
+        return
+
+    name = temp_name_entry.get().strip()
+    if not name:
+        messagebox.showerror("Error", "Name is required.")
+        return
+
+    if name in reference_embeddings:
+        if not messagebox.askyesno("Warning", f"User '{name}' already exists. Do you want to overwrite their data?"):
+            return
+
+    start = temp_start_entry.get().strip()
+    end = temp_end_entry.get().strip()
+    undef = temp_undef_var.get()
+
+    if not undef and (not start or not end):
+        messagebox.showwarning("Warning", "Start/End dates are empty. Consider checking 'Undefined Period' or filling them.")
+
+    reference_embeddings[name] = [temp_face_embedding, start, end, undef]
+    save_embeddings()
+    messagebox.showinfo("Success", f"User '{name}' added successfully.")
+
+    temp_face_embedding = None
+    temp_name_entry.delete(0, tk.END)
+    temp_start_entry.delete(0, tk.END)
+    temp_end_entry.delete(0, tk.END)
+    temp_undef_var.set(False)
+
+    global face_detection_status_label
+    if face_detection_status_label:
+        face_detection_status_label.config(text="No image selected.", fg="#f0f0f0")
+
+    show_admin_options()
+
+
+def add_user():
+    """
+    Afișează formularul pentru adăugarea unui nou utilizator.
+    """
+    global temp_name_entry, temp_start_entry, temp_end_entry, temp_undef_var, temp_face_embedding, face_detection_status_label, register_user_btn
+
+    stop_recognition_and_video()
+    clear_main_content_frame()
+    if video_label and video_label.winfo_exists():
+        video_label.grid_forget() # Asigură-te că video_label este ascuns
+    update_status("Maintenance", "orange")
+
+    # Configurăm gridul pentru a centra formularul de adăugare user
+    main_content_frame.grid_columnconfigure(0, weight=1)
+    main_content_frame.grid_columnconfigure(1, weight=1)
+    main_content_frame.grid_columnconfigure(2, weight=1)
+    main_content_frame.grid_rowconfigure(0, weight=1)
+
+    add_user_form_frame = tk.Frame(main_content_frame, bg="#1a1a1a")
+    add_user_form_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+
+    tk.Label(add_user_form_frame, text="Name:", bg="#1a1a1a", fg="#f0f0f0", font=("Arial", 12, "bold")).pack(pady=(10,5)) # Mărit fontul și padding
+    temp_name_entry = tk.Entry(add_user_form_frame, bg="#2a2a2a", fg="#f0f0f0", insertbackground="#f0f0f0", bd=1, relief="solid", font=("Arial", 12)) # Mărit fontul
+    temp_name_entry.pack(ipadx=10, ipady=5) # Mărit padding
+
+    tk.Label(add_user_form_frame, text="Start Date (YYYY-MM-DD):", bg="#1a1a1a", fg="#f0f0f0", font=("Arial", 12, "bold")).pack(pady=(10,5)) # Mărit fontul și padding
+    temp_start_entry = tk.Entry(add_user_form_frame, bg="#2a2a2a", fg="#f0f0f0", insertbackground="#f0f0f0", bd=1, relief="solid", font=("Arial", 12)) # Mărit fontul
+    temp_start_entry.pack(ipadx=10, ipady=5) # Mărit padding
+
+    tk.Label(add_user_form_frame, text="End Date (YYYY-MM-DD):", bg="#1a1a1a", fg="#f0f0f0", font=("Arial", 12, "bold")).pack(pady=(10,5)) # Mărit fontul și padding
+    temp_end_entry = tk.Entry(add_user_form_frame, bg="#2a2a2a", fg="#f0f0f0", insertbackground="#f0f0f0", bd=1, relief="solid", font=("Arial", 12)) # Mărit fontul
+    temp_end_entry.pack(ipadx=10, ipady=5) # Mărit padding
+
+    temp_undef_var = tk.BooleanVar()
+    undef_check = tk.Checkbutton(add_user_form_frame, text="Undefined Period", variable=temp_undef_var,
+                                 bg="#1a1a1a", fg="#f0f0f0", selectcolor="#2a2a2a",
+                                 activebackground="#2a2a2a", activeforeground="#f0f0f0",
+                                 font=("Arial", 12, "bold"), relief="flat", bd=0) # Mărit fontul
+    undef_check.pack(pady=15) # Mărit padding
+
+    tk.Button(add_user_form_frame, text="Choose Image", command=process_chosen_image, **button_style).pack(pady=10) # Mărit padding
+
+    face_detection_status_label = tk.Label(add_user_form_frame, text="No face selected.", bg="#1a1a1a", fg="#f0f0f0", font=("Arial", 12, "italic")) # Mărit fontul
+    face_detection_status_label.pack(pady=(0, 15)) # Mărit padding
+
+    register_button_frame = tk.Frame(add_user_form_frame, bg="#1a1a1a")
+    register_button_frame.pack(pady=10)
+
+    register_user_btn = tk.Button(register_button_frame, text="Add User", command=register_user_data, **button_style)
+    register_user_btn.pack(side=tk.LEFT, padx=10) # Mărit padding
+    register_user_btn.config(state=tk.DISABLED)
+
+    tk.Button(register_button_frame, text="Cancel", command=show_admin_options, **button_style).pack(side=tk.LEFT, padx=10) # Mărit padding
+
+
+def delete_user():
+    """
+    Afișează lista utilizatorilor și permite ștergerea lor.
+    """
+    stop_recognition_and_video()
+    clear_main_content_frame()
+    if video_label and video_label.winfo_exists():
+        video_label.grid_forget() # Asigură-te că video_label este ascuns
+    update_status("Maintenance", "orange")
+
+    # Configurăm gridul pentru a centra lista de ștergere user
+    main_content_frame.grid_columnconfigure(0, weight=1)
+    main_content_frame.grid_columnconfigure(1, weight=1)
+    main_content_frame.grid_columnconfigure(2, weight=1)
+    main_content_frame.grid_rowconfigure(0, weight=1)
+
+    delete_user_frame = tk.Frame(main_content_frame, bg="#1a1a1a")
+    delete_user_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+
+    tk.Label(delete_user_frame, text="Select a user to delete:", bg="#1a1a1a", fg="#f0f0f0", font=("Arial", 14, "bold")).pack(pady=(10,10)) # Mărit fontul
+
+    listbox = tk.Listbox(delete_user_frame, bg="#2a2a2a", fg="#f0f0f0", selectbackground="#007bff", selectforeground="white",
+                         font=("Arial", 12), bd=1, relief="solid") # Mărit fontul
+    for name, data in reference_embeddings.items():
+        display_text = f"{name}"
+        if data[3]: # daca e undefined
+            display_text += " (Undefined)"
+        listbox.insert(tk.END, display_text)
+    listbox.pack(pady=10, padx=10, fill="both", expand=True) # Mărit padding
+
+    def confirm_delete():
+        selected_index = listbox.curselection()
+        if selected_index:
+            selected_name_display = listbox.get(selected_index[0])
+            actual_name = selected_name_display.split('(')[0].strip() # Extragem numele real
+
+            if actual_name in reference_embeddings:
+                if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete user '{actual_name}'?"):
+                    del reference_embeddings[actual_name]
+                    save_embeddings()
+                    messagebox.showinfo("Success", f"User '{actual_name}' deleted successfully.")
+                    show_admin_options()
+                # Nu mai este necesar else-ul aici, deoarece if-ul de mai sus acoperă cazul
+            else:
+                messagebox.showerror("Error", "User not found in data.") # Mesajul de eroare dacă numele nu este găsit
+        else:
+            messagebox.showwarning("No Selection", "Please select a user to delete.")
+
+    button_frame = tk.Frame(delete_user_frame, bg="#1a1a1a")
+    button_frame.pack(pady=15) # Mărit padding
+
+    tk.Button(button_frame, text="Delete", command=confirm_delete, **button_style).pack(side=tk.LEFT, padx=10) # Mărit padding
+    tk.Button(button_frame, text="Cancel", command=show_admin_options, **button_style).pack(side=tk.LEFT, padx=10) # Mărit padding
+
+
+# --- GUI Setup ---
+root = tk.Tk()
+root.title("Access Control System")
+root.geometry("800x600")
+root.configure(bg="#1a1a1a")
+
+# Stilurile butoanelor (actualizat pentru font mai mare)
+button_style = {
+    "bg": "#007bff",
+    "fg": "white",
+    "font": ("Arial", 14, "bold"), # Dimensiune font mărită global pentru butoane
+    "relief": "flat",
+    "borderwidth": 0,
+    "highlightthickness": 0,
+    "activebackground": "#0056b3",
+    "activeforeground": "white",
+    "padx": 15, # Mărit padding-ul
+    "pady": 8,  # Mărit padding-ul
+}
+
+# Label-ul de status este plasat direct în root
+status_label = tk.Label(root, text="System Initializing...", font=("Arial", 24, "bold"), fg="#f0f0f0", bg="#1a1a1a")
+status_label.pack(pady=(10, 20))
+
+# Frame-ul principal pentru conținut (sub status_label)
+main_content_frame = tk.Frame(root, bg="#1a1a1a")
+main_content_frame.pack(expand=True, fill="both", padx=20, pady=10)
+
+# Configurăm main_content_frame să aibă 2 coloane
+main_content_frame.grid_columnconfigure(0, weight=1)
+main_content_frame.grid_columnconfigure(1, weight=0)
+main_content_frame.grid_rowconfigure(0, weight=1)
+
+# video_label este None inițial, va fi creat la primul apel back_to_main()
+video_label = None
+
+# Timer pentru oprirea automată a verificării
+verification_timer = None
+
+# Inițializează și încarcă embeddings-urile
+load_embeddings()
+
+# Setează interfața inițială
+back_to_main()
+
+# Rulează aplicația Tkinter
+root.mainloop()
